@@ -11,9 +11,18 @@ const closetItems = [
 function App() {
   const [recommendations, setRecommendations] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
+
+  const getItemIcon = (category) => {
+    if (category === "상의") return "👕";
+    if (category === "하의") return "👖";
+    if (category === "아우터") return "🧥";
+    return "👟";
+  };
 
   const getAIRecommendation = async () => {
     setLoading(true);
+    setErrorMessage("");
 
     try {
       const res = await fetch("http://localhost:4000/api/recommend", {
@@ -32,18 +41,19 @@ function App() {
       console.log("AI 응답:", data);
 
       if (!res.ok) {
-        alert(data.detail || data.error || "서버 오류가 발생했습니다.");
+        const message = data.detail || data.error || "서버 오류가 발생했습니다.";
+        setErrorMessage(message);
         return;
       }
 
-      if (data.recommendations) {
+      if (data.recommendations && Array.isArray(data.recommendations)) {
         setRecommendations(data.recommendations);
       } else {
-        alert("추천 데이터를 불러오지 못했습니다.");
+        setErrorMessage("추천 데이터를 불러오지 못했습니다.");
       }
     } catch (error) {
       console.error("에러 발생:", error);
-      alert("AI 추천을 불러오지 못했습니다.");
+      setErrorMessage("AI 추천을 불러오지 못했습니다.");
     } finally {
       setLoading(false);
     }
@@ -100,15 +110,7 @@ function App() {
           <div className="closet-list">
             {closetItems.map((item) => (
               <div className="closet-card" key={item.id}>
-                <div className="closet-icon">
-                  {item.category === "상의"
-                    ? "👕"
-                    : item.category === "하의"
-                    ? "👖"
-                    : item.category === "아우터"
-                    ? "🧥"
-                    : "👟"}
-                </div>
+                <div className="closet-icon">{getItemIcon(item.category)}</div>
                 <div>
                   <h4>{item.name}</h4>
                   <p>
@@ -123,32 +125,47 @@ function App() {
         <section className="section">
           <div className="section-header">
             <h3>AI 추천 코디</h3>
-            <button>더보기</button>
+            <button onClick={getAIRecommendation}>더보기</button>
           </div>
+
+          {errorMessage && (
+            <div className="recommendation-card">
+              <div className="recommendation-top">
+                <span className="small-badge">오류</span>
+              </div>
+              <h4>추천을 불러오지 못했어요</h4>
+              <p>{errorMessage}</p>
+              <button className="secondary-btn" onClick={getAIRecommendation}>
+                다시 시도
+              </button>
+            </div>
+          )}
 
           <div className="recommendation-list">
             {recommendations.length > 0 ? (
               recommendations.map((item, index) => (
                 <div className="recommendation-card" key={index}>
                   <div className="recommendation-top">
-                    <span className="small-badge">{item.tag}</span>
+                    <span className="small-badge">{item.tag || "AI 추천"}</span>
                   </div>
-                  <h4>{item.title}</h4>
-                  <p>{item.desc}</p>
+                  <h4>{item.title || `추천 코디 ${index + 1}`}</h4>
+                  <p>{item.desc || "추천 설명이 없습니다."}</p>
                   <button className="secondary-btn">이 코디 보기</button>
                 </div>
               ))
             ) : (
-              <div className="recommendation-card">
-                <div className="recommendation-top">
-                  <span className="small-badge">AI 대기 중</span>
+              !errorMessage && (
+                <div className="recommendation-card">
+                  <div className="recommendation-top">
+                    <span className="small-badge">AI 대기 중</span>
+                  </div>
+                  <h4>추천을 아직 생성하지 않았어요</h4>
+                  <p>상단의 추천 받기 버튼을 눌러 AI 코디를 생성해보세요.</p>
+                  <button className="secondary-btn" onClick={getAIRecommendation}>
+                    추천 받기
+                  </button>
                 </div>
-                <h4>추천을 아직 생성하지 않았어요</h4>
-                <p>상단의 추천 받기 버튼을 눌러 AI 코디를 생성해보세요.</p>
-                <button className="secondary-btn" onClick={getAIRecommendation}>
-                  추천 받기
-                </button>
-              </div>
+              )
             )}
           </div>
         </section>
