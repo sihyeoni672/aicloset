@@ -1,0 +1,5 @@
+서버에서 cd server
+node index.mjs
+
+메인 터미널에서
+node index.mjs
