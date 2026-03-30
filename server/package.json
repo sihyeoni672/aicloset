@@ -11,13 +11,14 @@
   "license": "ISC",
   "dependencies": {
     "@google/genai": "^1.44.0",
+    "bcrypt": "^6.0.0",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
     "multer": "^2.1.1",
     "mysql2": "^3.20.0",
     "zod": "^4.3.6",
     "zod-to-json-schema": "^3.25.1"
-  },
-  "type": "commonjs"
+  }
 }

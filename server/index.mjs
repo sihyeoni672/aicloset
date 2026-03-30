@@ -1,442 +1,458 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import mysql from "mysql2/promise";
 import multer from "multer";
 import fs from "fs";
 import path from "path";
-import mysql from "mysql2/promise";
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
+import { GoogleGenAI } from "@google/genai";
 import { fileURLToPath } from "url";
-
-dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const app = express();
-const PORT = process.env.PORT || 4000;
+dotenv.config({ path: path.join(__dirname, ".env") });
 
-app.use(cors());
+const app = express();
+const PORT = Number(process.env.PORT) || 4000;
+
+app.use(
+  cors({
+    origin: ["http://localhost:5173", "http://localhost:5174"],
+    credentials: false,
+  })
+);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const uploadsDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
+  fs.mkdirSync(uploadsDir);
 }
-
 app.use("/uploads", express.static(uploadsDir));
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, uploadsDir);
-  },
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname || "");
-    const safeName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
-    cb(null, safeName);
-  },
+const upload = multer({
+  dest: uploadsDir,
 });
 
-const upload = multer({ storage });
-
-const pool = mysql.createPool({
+const db = await mysql.createConnection({
   host: process.env.DB_HOST || "localhost",
+  port: Number(process.env.DB_PORT) || 3306,
   user: process.env.DB_USER || "root",
   password: process.env.DB_PASSWORD || "",
   database: process.env.DB_NAME || "aicloset",
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
 });
 
-const normalizeText = (value) => String(value || "").trim().toLowerCase();
+console.log("MySQL 연결 성공");
 
-const makeRecommendationKey = (item) => {
-  return [
-    item?.top || "",
-    item?.bottom || "",
-    item?.outer || "",
-    item?.shoes || "",
-  ]
-    .join("|")
-    .toLowerCase()
-    .trim();
-};
+const ai = process.env.GEMINI_API_KEY
+  ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
+  : null;
 
-const scoreItemForWeather = (item, weather) => {
-  const season = normalizeText(item.season);
-  const name = normalizeText(item.name);
-  let score = 0;
+function createToken(user) {
+  return jwt.sign(
+    {
+      id: user.id,
+      username: user.username,
+      nickname: user.nickname || "",
+    },
+    process.env.JWT_SECRET || "default_secret",
+    { expiresIn: "7d" }
+  );
+}
 
-  if (weather === "sunny") {
-    if (season.includes("봄") || season.includes("여름")) score += 3;
-    if (name.includes("셔츠") || name.includes("반팔") || name.includes("스커트")) score += 2;
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.startsWith("Bearer ")
+    ? authHeader.slice(7)
+    : null;
+
+  if (!token) {
+    return res.status(401).json({ error: "로그인이 필요합니다." });
   }
 
-  if (weather === "cloudy") {
-    if (season.includes("봄") || season.includes("가을")) score += 3;
-    if (name.includes("니트") || name.includes("셔츠") || name.includes("데님")) score += 2;
-  }
-
-  if (weather === "rainy") {
-    if (name.includes("자켓") || name.includes("바람막이") || name.includes("데님")) score += 3;
-    if (season.includes("봄") || season.includes("가을")) score += 1;
-  }
-
-  if (weather === "cold") {
-    if (season.includes("가을") || season.includes("겨울")) score += 4;
-    if (name.includes("니트") || name.includes("코트") || name.includes("패딩") || name.includes("자켓")) score += 3;
-  }
-
-  return score;
-};
-
-const scoreItemForMood = (item, mood) => {
-  const name = normalizeText(item.name);
-  const color = normalizeText(item.color);
-  let score = 0;
-
-  if (mood === "출근룩") {
-    if (name.includes("셔츠") || name.includes("슬랙스") || name.includes("자켓")) score += 3;
-    if (color.includes("블랙") || color.includes("화이트") || color.includes("베이지") || color.includes("네이비")) score += 2;
-  }
-
-  if (mood === "캠퍼스룩") {
-    if (name.includes("맨투맨") || name.includes("후드") || name.includes("데님") || name.includes("스니커즈")) score += 3;
-  }
-
-  if (mood === "데이트룩") {
-    if (color.includes("화이트") || color.includes("크림") || color.includes("베이지") || color.includes("핑크")) score += 2;
-    if (name.includes("니트") || name.includes("스커트") || name.includes("블라우스")) score += 3;
-  }
-
-  if (mood === "캐주얼룩") {
-    if (name.includes("데님") || name.includes("티") || name.includes("스니커즈")) score += 3;
-  }
-
-  return score;
-};
-
-const scoreItem = (item, weather, mood) => {
-  return scoreItemForWeather(item, weather) + scoreItemForMood(item, mood);
-};
-
-const sortByScore = (items, weather, mood) => {
-  return [...items].sort((a, b) => scoreItem(b, weather, mood) - scoreItem(a, weather, mood));
-};
-
-const pickBest = (items, weather, mood) => {
-  const sorted = sortByScore(items, weather, mood);
-  return sorted[0] || null;
-};
-
-const buildDescription = ({ top, bottom, outer, shoes, weather, mood }) => {
-  const parts = [];
-  if (top) parts.push(`${top}를 중심으로`);
-  if (bottom) parts.push(`${bottom}와 매치하고`);
-  if (outer) parts.push(`${outer}로 레이어드를 더해`);
-  if (shoes) parts.push(`${shoes}로 마무리하는`);
-  return `${parts.join(" ")} ${mood} 느낌의 ${weather} 날씨용 코디예요.`.trim();
-};
-
-const buildPoint = ({ top, bottom, outer, weather, mood }) => {
-  if (weather === "rainy") {
-    return "비 오는 날에는 관리 쉬운 톤과 가벼운 아우터 조합이 실용적이에요.";
-  }
-  if (weather === "cold") {
-    return "기온이 낮을수록 상의와 아우터의 레이어드가 스타일과 보온을 같이 챙겨줘요.";
-  }
-  if (mood === "데이트룩") {
-    return "밝거나 부드러운 톤 아이템을 한 가지 넣으면 분위기가 더 살아나요.";
-  }
-  if (mood === "출근룩") {
-    return "깔끔한 상하의 조합에 단정한 아우터를 더하면 안정감이 좋아요.";
-  }
-  if (outer) {
-    return "아우터를 더해 실루엣이 정리되고 완성도가 높아져요.";
-  }
-  return "너무 과한 조합보다 기본형 아이템 중심으로 맞추면 실패가 적어요.";
-};
-
-const buildTitle = ({ top, bottom, outer, shoes }) => {
-  const parts = [top, bottom, outer, shoes].filter(Boolean);
-  return parts.slice(0, 3).join(" + ");
-};
-
-const uniqueById = (items) => {
-  const seen = new Set();
-  return items.filter((item) => {
-    if (!item?.id) return true;
-    if (seen.has(item.id)) return false;
-    seen.add(item.id);
-    return true;
-  });
-};
-
-const buildRecommendationsFromCloset = (closetItems, weather, mood) => {
-  const tops = uniqueById(closetItems.filter((i) => i.category === "상의"));
-  const bottoms = uniqueById(closetItems.filter((i) => i.category === "하의"));
-  const outers = uniqueById(closetItems.filter((i) => i.category === "아우터"));
-  const shoes = uniqueById(closetItems.filter((i) => i.category === "신발"));
-
-  const sortedTops = sortByScore(tops, weather, mood);
-  const sortedBottoms = sortByScore(bottoms, weather, mood);
-  const sortedOuters = sortByScore(outers, weather, mood);
-  const sortedShoes = sortByScore(shoes, weather, mood);
-
-  const candidates = [];
-
-  if (sortedTops.length && sortedBottoms.length) {
-    for (const top of sortedTops.slice(0, 4)) {
-      for (const bottom of sortedBottoms.slice(0, 4)) {
-        const outer = weather === "cold" || weather === "rainy" || mood === "출근룩"
-          ? sortedOuters.find((item) => item.id !== top.id && item.id !== bottom.id) || null
-          : sortedOuters[0] || null;
-
-        const shoe = sortedShoes[0] || null;
-
-        candidates.push({
-          tag: mood,
-          title: buildTitle({
-            top: top.name,
-            bottom: bottom.name,
-            outer: outer?.name || "",
-            shoes: shoe?.name || "",
-          }),
-          top: top.name,
-          bottom: bottom.name,
-          outer: outer?.name || "",
-          shoes: shoe?.name || "",
-          desc: buildDescription({
-            top: top.name,
-            bottom: bottom.name,
-            outer: outer?.name || "",
-            shoes: shoe?.name || "",
-            weather,
-            mood,
-          }),
-          point: buildPoint({
-            top: top.name,
-            bottom: bottom.name,
-            outer: outer?.name || "",
-            weather,
-            mood,
-          }),
-          score:
-            scoreItem(top, weather, mood) +
-            scoreItem(bottom, weather, mood) +
-            (outer ? scoreItem(outer, weather, mood) : 0) +
-            (shoe ? scoreItem(shoe, weather, mood) : 0),
-        });
-      }
-    }
-  }
-
-  if (!candidates.length && sortedTops.length) {
-    for (const top of sortedTops.slice(0, 4)) {
-      const outer = (weather === "cold" || weather === "rainy") ? sortedOuters[0] || null : null;
-      const shoe = sortedShoes[0] || null;
-
-      candidates.push({
-        tag: mood,
-        title: buildTitle({
-          top: top.name,
-          bottom: "",
-          outer: outer?.name || "",
-          shoes: shoe?.name || "",
-        }),
-        top: top.name,
-        bottom: "",
-        outer: outer?.name || "",
-        shoes: shoe?.name || "",
-        desc: buildDescription({
-          top: top.name,
-          bottom: "",
-          outer: outer?.name || "",
-          shoes: shoe?.name || "",
-          weather,
-          mood,
-        }),
-        point: buildPoint({
-          top: top.name,
-          bottom: "",
-          outer: outer?.name || "",
-          weather,
-          mood,
-        }),
-        score: scoreItem(top, weather, mood) + (outer ? scoreItem(outer, weather, mood) : 0),
-      });
-    }
-  }
-
-  if (!candidates.length && sortedBottoms.length) {
-    for (const bottom of sortedBottoms.slice(0, 4)) {
-      const shoe = sortedShoes[0] || null;
-
-      candidates.push({
-        tag: mood,
-        title: buildTitle({
-          top: "",
-          bottom: bottom.name,
-          outer: "",
-          shoes: shoe?.name || "",
-        }),
-        top: "",
-        bottom: bottom.name,
-        outer: "",
-        shoes: shoe?.name || "",
-        desc: buildDescription({
-          top: "",
-          bottom: bottom.name,
-          outer: "",
-          shoes: shoe?.name || "",
-          weather,
-          mood,
-        }),
-        point: buildPoint({
-          top: "",
-          bottom: bottom.name,
-          outer: "",
-          weather,
-          mood,
-        }),
-        score: scoreItem(bottom, weather, mood),
-      });
-    }
-  }
-
-  const deduped = [];
-  const seen = new Set();
-
-  for (const item of candidates.sort((a, b) => b.score - a.score)) {
-    const key = makeRecommendationKey(item);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(item);
-  }
-
-  return deduped.map(({ score, ...rest }) => rest);
-};
-
-app.get("/health", (_req, res) => {
-  res.json({ ok: true });
-});
-
-app.get("/clothes", async (_req, res) => {
   try {
-    const [rows] = await pool.query(
-      `SELECT id, user_id, name, category, color, season, image_url, created_at
-       FROM clothes
-       ORDER BY id DESC`
+    const decoded = jwt.verify(
+      token,
+      process.env.JWT_SECRET || "default_secret"
+    );
+    req.user = decoded;
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: "유효하지 않은 토큰입니다." });
+  }
+}
+
+function pickRandom(arr) {
+  if (!arr.length) return "";
+  return arr[Math.floor(Math.random() * arr.length)].name;
+}
+
+function buildFallbackRecommendations(closetItems, weather, mood) {
+  const tops = closetItems.filter((item) => item.category === "상의");
+  const bottoms = closetItems.filter((item) => item.category === "하의");
+  const outers = closetItems.filter((item) => item.category === "아우터");
+  const shoes = closetItems.filter((item) => item.category === "신발");
+
+  const recs = [];
+
+  for (let i = 0; i < 3; i += 1) {
+    const top = pickRandom(tops);
+    const bottom = pickRandom(bottoms);
+    const outer =
+      weather === "rainy" || weather === "cold" || weather === "cloudy"
+        ? pickRandom(outers)
+        : "";
+    const shoe = pickRandom(shoes);
+
+    recs.push({
+      tag:
+        mood === "출근룩"
+          ? "비즈니스 캐주얼"
+          : mood === "데이트룩"
+          ? "모던 캐주얼"
+          : mood === "캠퍼스룩"
+          ? "캠퍼스 데일리"
+          : "데일리 캐주얼",
+      title: `${mood} 추천 코디 ${i + 1}`,
+      top,
+      bottom,
+      outer,
+      shoes: shoe,
+      desc: `${weather} 날씨에 어울리도록 현재 옷장에 저장된 아이템만으로 조합한 코디예요.`,
+      point: `${top || "상의"}와 ${bottom || "하의"} 중심으로 무난하게 입기 좋아요.`,
+    });
+  }
+
+  return recs.filter((item) => item.top || item.bottom || item.outer || item.shoes);
+}
+
+app.post("/api/signup", async (req, res) => {
+  try {
+    const { username, password, nickname } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({
+        error: "아이디와 비밀번호를 입력해주세요.",
+      });
+    }
+
+    const [exists] = await db.execute(
+      "SELECT id FROM users WHERE username = ?",
+      [username]
+    );
+
+    if (exists.length > 0) {
+      return res.status(400).json({
+        error: "이미 존재하는 아이디입니다.",
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    await db.execute(
+      "INSERT INTO users (username, password, nickname) VALUES (?, ?, ?)",
+      [username, hashedPassword, nickname || null]
+    );
+
+    res.json({
+      message: "회원가입이 완료되었습니다.",
+    });
+  } catch (error) {
+    console.error("회원가입 오류:", error);
+    res.status(500).json({
+      error: "회원가입 중 오류가 발생했습니다.",
+    });
+  }
+});
+
+app.post("/api/login", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({
+        error: "아이디와 비밀번호를 입력해주세요.",
+      });
+    }
+
+    const [rows] = await db.execute(
+      "SELECT * FROM users WHERE username = ?",
+      [username]
+    );
+
+    if (!rows.length) {
+      return res.status(401).json({
+        error: "아이디 또는 비밀번호가 올바르지 않습니다.",
+      });
+    }
+
+    const user = rows[0];
+    const isMatch = await bcrypt.compare(password, user.password);
+
+    if (!isMatch) {
+      return res.status(401).json({
+        error: "아이디 또는 비밀번호가 올바르지 않습니다.",
+      });
+    }
+
+    const token = createToken(user);
+
+    res.json({
+      message: "로그인 성공",
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        nickname: user.nickname || "",
+      },
+    });
+  } catch (error) {
+    console.error("로그인 오류:", error);
+    res.status(500).json({
+      error: "로그인 중 오류가 발생했습니다.",
+    });
+  }
+});
+
+app.get("/api/me", authMiddleware, async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      "SELECT id, username, nickname FROM users WHERE id = ?",
+      [req.user.id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: "사용자를 찾을 수 없습니다." });
+    }
+
+    res.json(rows[0]);
+  } catch (error) {
+    console.error("내 정보 조회 오류:", error);
+    res.status(500).json({ error: "내 정보 조회 중 오류가 발생했습니다." });
+  }
+});
+
+app.get("/api/clothes", authMiddleware, async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      "SELECT * FROM clothes WHERE user_id = ? ORDER BY id DESC",
+      [req.user.id]
     );
     res.json(rows);
   } catch (error) {
-    console.error("GET /clothes error:", error);
-    res.status(500).json({ message: "옷 목록 조회에 실패했습니다." });
-  }
-});
-
-app.post("/clothes", upload.single("image"), async (req, res) => {
-  try {
-    const { name, category, color, season } = req.body;
-
-    if (!name || !category) {
-      return res.status(400).json({ message: "이름과 카테고리는 필수입니다." });
-    }
-
-    if (!req.file) {
-      return res.status(400).json({ message: "이미지 파일이 필요합니다." });
-    }
-
-    const imageUrl = `/uploads/${req.file.filename}`;
-
-    const [result] = await pool.query(
-      `INSERT INTO clothes (user_id, name, category, color, season, image_url)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [1, name, category, color || "", season || "", imageUrl]
-    );
-
-    res.status(201).json({
-      message: "저장 성공",
-      id: result.insertId,
-      image_url: imageUrl,
+    console.error("옷 목록 조회 오류:", error);
+    res.status(500).json({
+      error: "옷 목록 조회 실패",
+      detail: error.message,
     });
-  } catch (error) {
-    console.error("POST /clothes error:", error);
-    res.status(500).json({ message: "옷 저장에 실패했습니다." });
   }
 });
 
-app.delete("/clothes/:id", async (req, res) => {
+app.post(
+  "/api/clothes",
+  authMiddleware,
+  upload.single("image"),
+  async (req, res) => {
+    try {
+      const { name, category, color, season } = req.body;
+
+      if (!name || !category) {
+        return res.status(400).json({
+          error: "이름과 카테고리는 필수입니다.",
+        });
+      }
+
+      const imageUrl = req.file ? `/uploads/${req.file.filename}` : null;
+
+      const [result] = await db.execute(
+        "INSERT INTO clothes (user_id, name, category, color, season, image_url) VALUES (?, ?, ?, ?, ?, ?)",
+        [req.user.id, name, category, color || null, season || null, imageUrl]
+      );
+
+      const [rows] = await db.execute("SELECT * FROM clothes WHERE id = ?", [
+        result.insertId,
+      ]);
+
+      res.json(rows[0]);
+    } catch (error) {
+      console.error("옷 저장 오류:", error);
+      res.status(500).json({
+        error: "옷 저장 실패",
+        detail: error.message,
+      });
+    }
+  }
+);
+
+app.delete("/api/clothes/:id", authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
 
-    const [rows] = await pool.query(`SELECT image_url FROM clothes WHERE id = ?`, [id]);
+    const [rows] = await db.execute(
+      "SELECT * FROM clothes WHERE id = ? AND user_id = ?",
+      [id, req.user.id]
+    );
 
     if (!rows.length) {
-      return res.status(404).json({ message: "삭제할 옷을 찾지 못했습니다." });
+      return res.status(404).json({
+        error: "삭제할 옷을 찾을 수 없습니다.",
+      });
     }
 
-    const imageUrl = rows[0].image_url;
-    await pool.query(`DELETE FROM clothes WHERE id = ?`, [id]);
+    await db.execute("DELETE FROM clothes WHERE id = ? AND user_id = ?", [
+      id,
+      req.user.id,
+    ]);
 
-    if (imageUrl) {
-      const filePath = path.join(__dirname, imageUrl.replace(/^\//, ""));
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
-    }
-
-    res.json({ message: "삭제 성공" });
+    res.json({ message: "삭제 완료" });
   } catch (error) {
-    console.error("DELETE /clothes/:id error:", error);
-    res.status(500).json({ message: "삭제에 실패했습니다." });
+    console.error("옷 삭제 오류:", error);
+    res.status(500).json({
+      error: "옷 삭제 실패",
+      detail: error.message,
+    });
   }
 });
 
-app.post("/api/recommend", async (req, res) => {
+app.post("/api/recommend", authMiddleware, async (req, res) => {
   try {
-    const {
-      closetItems = [],
-      weather = "cloudy",
-      mood = "출근룩",
-      previousRecommendations = [],
-      previousKeys = [],
-    } = req.body;
+    const { weather, mood, previousKeys = [] } = req.body;
 
-    if (!Array.isArray(closetItems) || closetItems.length === 0) {
-      return res.status(400).json({ message: "추천할 옷 데이터가 없습니다." });
-    }
-
-    const blockedKeys = new Set([
-      ...previousKeys.map((v) => String(v).toLowerCase().trim()),
-      ...previousRecommendations.map(makeRecommendationKey),
-    ]);
-
-    const candidates = buildRecommendationsFromCloset(closetItems, weather, mood);
-
-    if (!candidates.length) {
-      return res.json({ recommendations: [] });
-    }
-
-    const filtered = candidates.filter(
-      (item) => !blockedKeys.has(makeRecommendationKey(item))
+    const [rows] = await db.execute(
+      "SELECT * FROM clothes WHERE user_id = ? ORDER BY id DESC",
+      [req.user.id]
     );
 
-    const source = filtered.length > 0 ? filtered : candidates;
+    const closetItems = rows;
 
-    const shuffled = [...source].sort(() => Math.random() - 0.5);
-    const finalRecommendations = shuffled.slice(0, 3);
+    if (!closetItems.length) {
+      return res.status(400).json({
+        error: "옷장에 저장된 옷이 없습니다.",
+      });
+    }
+
+    const grouped = {
+      상의: closetItems.filter((item) => item.category === "상의").map((item) => item.name),
+      하의: closetItems.filter((item) => item.category === "하의").map((item) => item.name),
+      아우터: closetItems.filter((item) => item.category === "아우터").map((item) => item.name),
+      신발: closetItems.filter((item) => item.category === "신발").map((item) => item.name),
+    };
+
+    if (!ai) {
+      return res.json({
+        recommendations: buildFallbackRecommendations(closetItems, weather, mood),
+      });
+    }
+
+    const prompt = `
+너는 사용자의 옷장만으로 코디를 추천하는 스타일리스트다.
+
+절대 규칙:
+1. 반드시 아래 옷장 목록에 있는 "name" 값만 사용한다.
+2. 목록에 없는 옷 이름을 새로 만들면 안 된다.
+3. top, bottom, outer, shoes 값은 반드시 아래 목록 중 하나이거나 빈 문자열("")이어야 한다.
+4. 정확히 3개의 추천만 반환한다.
+5. previousKeys와 최대한 겹치지 않게 한다.
+6. JSON 외의 설명은 절대 출력하지 않는다.
+
+현재 날씨: ${weather}
+현재 무드: ${mood}
+
+옷장 목록:
+상의: ${JSON.stringify(grouped.상의)}
+하의: ${JSON.stringify(grouped.하의)}
+아우터: ${JSON.stringify(grouped.아우터)}
+신발: ${JSON.stringify(grouped.신발)}
+
+이전 추천 키:
+${JSON.stringify(previousKeys)}
+
+반환 형식:
+{
+  "recommendations": [
+    {
+      "tag": "비즈니스 캐주얼",
+      "title": "코디 제목",
+      "top": "상의 이름",
+      "bottom": "하의 이름",
+      "outer": "아우터 이름 또는 빈 문자열",
+      "shoes": "신발 이름 또는 빈 문자열",
+      "desc": "왜 이 조합이 어울리는지 설명",
+      "point": "스타일 포인트"
+    }
+  ]
+}
+`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+      },
+    });
+
+    const text = response.text?.trim?.() || "";
+    const parsed = JSON.parse(text);
+
+    if (!parsed.recommendations || !Array.isArray(parsed.recommendations)) {
+      return res.status(500).json({
+        error: "recommendations 형식이 올바르지 않습니다.",
+      });
+    }
+
+    const validNames = new Set(closetItems.map((item) => item.name));
+
+    const safeRecommendations = parsed.recommendations
+      .map((item) => ({
+        tag: item.tag || "추천 코디",
+        title: item.title || "추천 룩",
+        top: item.top || "",
+        bottom: item.bottom || "",
+        outer: item.outer || "",
+        shoes: item.shoes || "",
+        desc: item.desc || "",
+        point: item.point || "",
+      }))
+      .filter((item) => {
+        const parts = [item.top, item.bottom, item.outer, item.shoes].filter(Boolean);
+        return parts.every((name) => validNames.has(name));
+      });
+
+    if (!safeRecommendations.length) {
+      return res.json({
+        recommendations: buildFallbackRecommendations(closetItems, weather, mood),
+      });
+    }
 
     res.json({
-      recommendations: finalRecommendations,
+      recommendations: safeRecommendations,
     });
   } catch (error) {
-    console.error("POST /api/recommend error:", error);
-    res.status(500).json({ error: "추천 생성 중 오류가 발생했습니다." });
+    console.error("추천 서버 오류:", error);
+
+    const message = error?.message || String(error);
+
+    if (
+      message.includes("503") ||
+      message.includes("high demand") ||
+      message.includes("UNAVAILABLE")
+    ) {
+      return res.json({
+        recommendations: buildFallbackRecommendations([], "cloudy", "캐주얼룩"),
+      });
+    }
+
+    return res.status(500).json({
+      error: "서버 오류가 발생했습니다.",
+      detail: message,
+    });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server running on http://localhost:${PORT}`);
 });
